@@ -12,6 +12,8 @@ from util import box_ops
 from util.misc import inverse_sigmoid
 from models.structures import Boxes, Instances, pairwise_iou
 
+from .deformable_transformer_plus import MLP
+
 
 def random_drop_tracks(track_instances: Instances, drop_probability: float) -> Instances:
     if drop_probability > 0 and len(track_instances) > 0:
@@ -79,6 +81,7 @@ class QueryInteractionModule(QueryInteractionBase):
             self.linear_pos2 = nn.Linear(hidden_dim, dim_in)
             self.dropout_pos1 = nn.Dropout(dropout)
             self.dropout_pos2 = nn.Dropout(dropout)
+            self.bbox_embed = MLP(dim_in, hidden_dim, 4, 3)
             self.norm_pos = nn.LayerNorm(dim_in)
 
         self.linear_feat1 = nn.Linear(dim_in, hidden_dim)
@@ -147,10 +150,10 @@ class QueryInteractionModule(QueryInteractionBase):
     def _update_track_embedding(self, track_instances: Instances) -> Instances:
         if len(track_instances) == 0:
             return track_instances
-        dim = track_instances.query_pos.shape[1]
+        dim = 256 # track_instances.query_pos.shape[1]
         out_embed = track_instances.output_embedding
-        query_pos = track_instances.query_pos[:, :dim // 2]
-        query_feat = track_instances.query_pos[:, dim//2:]
+        query_pos = track_instances.ref_pts # [num_queries, 256]
+        query_feat = track_instances.query_pos[:, :dim]  # [num_queries, 256]
         q = k = query_pos + out_embed
 
         tgt = out_embed
@@ -165,15 +168,15 @@ class QueryInteractionModule(QueryInteractionBase):
         if self.update_query_pos:
             query_pos2 = self.linear_pos2(self.dropout_pos1(self.activation(self.linear_pos1(tgt))))
             query_pos = query_pos + self.dropout_pos2(query_pos2)
-            query_pos = self.norm_pos(query_pos)
-            track_instances.query_pos[:, :dim // 2] = query_pos
+            query_pos = self.bbox_embed(self.norm_pos(query_pos)) + track_instances.query_pos[:, dim:].sigmoid()
+            track_instances.query_pos[:, dim:] = query_pos
 
         query_feat2 = self.linear_feat2(self.dropout_feat1(self.activation(self.linear_feat1(tgt))))
         query_feat = query_feat + self.dropout_feat2(query_feat2)
         query_feat = self.norm_feat(query_feat)
-        track_instances.query_pos[:, dim//2:] = query_feat
+        track_instances.query_pos[:, :dim] = query_feat
 
-        track_instances.ref_pts = inverse_sigmoid(track_instances.pred_boxes[:, :2].detach().clone())
+        track_instances.ref_pts = inverse_sigmoid(track_instances.pred_boxes.detach().clone()) # match the size 4 as the ref_pts initialized as anchor in dab-detr
         return track_instances
 
     def forward(self, data) -> Instances:

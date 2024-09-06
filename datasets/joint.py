@@ -98,8 +98,9 @@ class DetMOTDetection:
     def _pre_single_frame(self, idx: int):
         img_path = self.img_files[idx]
         label_path = self.label_files[idx]
-        if 'crowdhuman' in img_path:
-            img_path = img_path.replace('.jpg', '.png')
+        # no need here, since the format is jpg
+        # if 'crowdhuman' in img_path:
+        #     img_path = img_path.replace('.jpg', '.png')
         img = Image.open(img_path)
         targets = {}
         w, h = img._size

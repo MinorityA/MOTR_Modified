@@ -100,6 +100,8 @@ def get_args_parser():
     parser.add_argument('--max_size', default=1333, type=int)
     parser.add_argument('--val_width', default=800, type=int)
     parser.add_argument('--filter_ignore', action='store_true')
+    parser.add_argument('--random_refpoints_xy', action='store_true', 
+                        help="Random init the x,y of anchor boxes and freeze them.")
 
     # * Segmentation
     parser.add_argument('--masks', action='store_true',
