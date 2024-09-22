@@ -180,12 +180,11 @@ class DeformableTransformer(nn.Module):
             init_reference_out = reference_points
             pos_trans_out = self.pos_trans_norm(self.pos_trans(self.get_proposal_pos_embed(topk_coords_unact)))
             query_embed, tgt = torch.split(pos_trans_out, c, dim=2)
-        elif self.use_dab:
-            if ref_pts is not None:
-                reference_points = ref_pts.sigmoid()
-                tgt = query_embed[..., :self.d_model]
-                tgt = tgt.unsqueeze(0).expand(bs, -1, -1)
-                init_reference_out = reference_points
+        elif self.use_dab:            
+            reference_points = query_embed[..., self.d_model:].sigmoid()
+            tgt = query_embed[..., :self.d_model]
+            tgt = tgt.unsqueeze(0).expand(bs, -1, -1)
+            init_reference_out = reference_points
         else:
             query_embed, tgt = torch.split(query_embed, c, dim=1)
             query_embed = query_embed.unsqueeze(0).expand(bs, -1, -1)
@@ -385,8 +384,8 @@ class DeformableTransformerDecoderLayer(nn.Module):
 
         return tgt
 
-    def forward(self, tgt, query_pos, reference_points, src, src_spatial_shapes, level_start_index, src_padding_mask=None):
-        attn_mask = None
+    def forward(self, tgt, query_pos, reference_points, src, src_spatial_shapes, level_start_index, src_padding_mask=None, attn_mask=None):
+        # attn_mask = None
         if self.self_cross:
             return self._forward_self_cross(tgt, query_pos, reference_points, src, src_spatial_shapes,
                                             level_start_index, src_padding_mask, attn_mask)
@@ -410,6 +409,10 @@ class DeformableTransformerDecoder(nn.Module):
             self.query_scale = MLP(d_model, d_model, d_model, 2)
             self.ref_point_head = MLP(2*d_model, d_model, d_model, 2)
 
+        # add index selection for sqr
+        self.start_q = [0, 0, 1, 2, 4, 7, 12]
+        self.end_q = [1, 2, 4, 7, 12, 20, 33]
+
     def forward(self, tgt, reference_points, src, src_spatial_shapes, src_level_start_index, src_valid_ratios,
                 query_pos=None, src_padding_mask=None):
         output = tgt
@@ -417,29 +420,49 @@ class DeformableTransformerDecoder(nn.Module):
         bs = src.shape[0]
         reference_points = reference_points[None].repeat(bs, 1, 1)
 
+        # store query and reference points in a list
+        query_list_reserve = [output]
+        reference_points_reserve = [reference_points]
+
         intermediate = []
         intermediate_reference_points = []
         for lid, layer in enumerate(self.layers):
+
+            # select queries
+            start_q = self.start_q[lid]
+            end_q = self.end_q[lid]
+            query_list = query_list_reserve.copy()[start_q:end_q]
+            reference_points_list = reference_points_reserve.copy()[start_q:end_q]
+            reference_points_cat = torch.cat(reference_points_list, dim=0)
+
+            output = torch.cat(query_list, dim=0)
+            fakesetsize = int(output.shape[0] / bs)
+
             if reference_points.shape[-1] == 4:
-                reference_points_input = reference_points[:, :, None] \
-                                         * torch.cat([src_valid_ratios, src_valid_ratios], -1)[:, None] # bs, nq, 4, 4
+                reference_points_input = reference_points_cat[:, :, None] \
+                                         * torch.cat([src_valid_ratios, src_valid_ratios], -1)[:, None].repeat(fakesetsize, 1, 1, 1) # bs*fakesetsize, nq, 4, 4
             else:
                 assert reference_points.shape[-1] == 2
                 reference_points_input = reference_points[:, :, None] * src_valid_ratios[:, None]
 
             if self.use_dab:
-                query_sine_embed = gen_sineembed_for_position(reference_points_input[:, :, 0, :]) # bs, nq, 256 * 2
-                raw_query_pos = self.ref_point_head(query_sine_embed) # bs, nq, 256
+                query_sine_embed = gen_sineembed_for_position(reference_points_input[:, :, 0, :]) # bs*fakesetsize, nq, 256 * 2
+                raw_query_pos = self.ref_point_head(query_sine_embed) # bs*fakesetsize, nq, 256
                 pos_scale = self.query_scale(output) if lid != 0 else 1
                 query_pos = pos_scale * raw_query_pos
 
-            output = layer(output, query_pos, reference_points_input, src, src_spatial_shapes, src_level_start_index, src_padding_mask)
+            # repeat for layer inputs
+            src_repeat = src.repeat(fakesetsize, 1, 1)
+            src_padding_mask_repeat = src_padding_mask.repeat(fakesetsize, 1)
+
+            output = layer(output, query_pos, reference_points_input, src_repeat, 
+                           src_spatial_shapes, src_level_start_index, src_padding_mask_repeat)
 
             # hack implementation for iterative bounding box refinement
             if self.bbox_embed is not None:
                 tmp = self.bbox_embed[lid](output)
                 if reference_points.shape[-1] == 4:
-                    new_reference_points = tmp + inverse_sigmoid(reference_points)
+                    new_reference_points = tmp + inverse_sigmoid(reference_points_cat)
                     new_reference_points = new_reference_points.sigmoid()
                 else:
                     assert reference_points.shape[-1] == 2
@@ -448,9 +471,16 @@ class DeformableTransformerDecoder(nn.Module):
                     new_reference_points = new_reference_points.sigmoid()
                 reference_points = new_reference_points.detach()
 
+            # append new output into the query_list_reserve and reference_points_reserve
+            for i in range(fakesetsize):
+                query_list_reserve.append(output[bs*i:bs*(i+1), ...])
+                reference_points_reserve.append(reference_points[bs*i:bs*(i+1), ...])
+
+            # the intermediate also need to be changed
             if self.return_intermediate:
-                intermediate.append(output)
-                intermediate_reference_points.append(reference_points)
+                for i in range(fakesetsize):
+                    intermediate.append(output[bs*i:bs*(i+1), ...])
+                    intermediate_reference_points.append(reference_points[bs*i:bs*(i+1), ...])
 
         if self.return_intermediate:
             return torch.stack(intermediate), torch.stack(intermediate_reference_points), query_pos
