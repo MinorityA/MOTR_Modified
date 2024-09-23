@@ -42,18 +42,35 @@ class SPTracker(nn.Module):
         # process memory_bank to get src, src_spatial_shapes, src_level_start_index, src_padding_mask
         num_memory = len(memory_bank)
         src_flatten = []
+        src_masks_flatten = []
         spatial_shapes = []
-        for _, memories in enumerate(zip(*memory_bank)):
-            _, _, h, w = memories[0].shape
-            flatten_memories = torch.cat([memory.flatten(2) for memory in memories], dim=2).transpose(1, 2)
 
-            src_flatten.append(flatten_memories)
-            spatial_shapes.append((h*num_memory, w))
+        for _, memories in enumerate(zip(*memory_bank)):
+            maxH, maxW = max([tensor.shape[2] for tensor in memories]), max([tensor.shape[3] for tensor in memories])
+            dtype = memories[0].dtype
+            device = memories[0].device
+            c = memories[0].shape[1]
+            list_shape = (num_memory, c, maxH, maxW)
+
+            pad_imgs = torch.zeros(list_shape, dtype=dtype, device=device)
+            masks = torch.ones((num_memory, maxH, maxW), dtype=torch.bool, device=device)
+
+            for i in range(len(memories)):
+                img = memories[i]
+                pad_imgs[i, :img.shape[1], :img.shape[2], :img.shape[3]] = img.clone()
+                masks[i, :img.shape[2], :img.shape[3]] = False
+
+            pad_imgs = torch.cat(torch.unbind(pad_imgs, dim=0), dim=1)[None]
+            masks = torch.cat(torch.unbind(masks, dim=0), dim=0)[None]
+
+            src_flatten.append(torch.flatten(pad_imgs, 2).transpose(1,2))
+            src_masks_flatten.append(torch.flatten(masks, 1))
+            spatial_shapes.append((maxH*num_memory, maxW))
         
         src = torch.cat(src_flatten, dim=1)
         src_spatial_shapes = torch.as_tensor(spatial_shapes, dtype=torch.long, device=src.device)
         src_level_start_index = torch.cat((src_spatial_shapes.new_zeros((1, )), src_spatial_shapes.prod(1).cumsum(0)[:-1]))
-        src_padding_mask = torch.zeros(src.shape[:2], dtype=bool, device=src.device)
+        src_padding_mask = torch.cat(src_masks_flatten, dim=1)
 
         d_output = detect_instances.output_embedding # shape [query_size, query_dim(256)] 
         d_ref_pts = detect_instances.ref_pts  # shape [query_size, 4(x,y)]
